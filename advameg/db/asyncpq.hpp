@@ -47,13 +47,13 @@ public:
         {
             case error::connect_error:
             case error::general_error:
-                return msg;
+                return msg.load();
             default:
                 return "";
         }
     }
 
-    const char* msg{nullptr};
+    std::atomic<const char*> msg{nullptr};
 };
 } // namespace detail
 
@@ -170,8 +170,6 @@ struct data_extractor
     virtual void parse_raw_data(const char* buf, int nlen) = 0;
 };
 
-using data_extractor_ptr = std::unique_ptr<data_extractor>;
-
 template <class T>
 struct data_extractor_impl : data_extractor
 {
@@ -280,10 +278,10 @@ struct extractor_traits<T, typename std::enable_if<accepted_by_date_time_extract
 };
 
 template <class T>
-typename std::enable_if<detail::is_basic_singular<T>::value>::type extract_value(data_extractor_ptr pe, T& output)
+typename std::enable_if<detail::is_basic_singular<T>::value>::type extract_value(data_extractor* pe, T& output)
 {
     BOOST_ASSERT(pe);
-    auto e = dynamic_cast<typename extractor_traits<T>::type*>(pe.get());
+    auto e = dynamic_cast<typename extractor_traits<T>::type*>(pe);
     if (!e)
         BOOST_THROW_EXCEPTION(std::runtime_error{"Invalid extractor type."});
     output = static_cast<T>(e->value);
@@ -340,10 +338,10 @@ void extract_array(std::string const& s, Output& result)
 }
 
 template <class T>
-typename std::enable_if<is_stl_array<T>::value>::type extract_value(data_extractor_ptr pe, T& output)
+typename std::enable_if<is_stl_array<T>::value>::type extract_value(data_extractor* pe, T& output)
 {
     BOOST_ASSERT(pe);
-    auto e = dynamic_cast<typename extractor_traits<T>::type*>(pe.get());
+    auto e = dynamic_cast<typename extractor_traits<T>::type*>(pe);
     if (!e)
         BOOST_THROW_EXCEPTION(std::runtime_error{"Invalid extractor type."});
     extract_array(e->value, output);
@@ -408,6 +406,8 @@ struct result final
         return nfields;
     }
 
+    auto operator[](std::size_t) = delete;
+
     auto begin() const noexcept
     {
         return row_const_iterator{*this};
@@ -453,7 +453,7 @@ struct result final
             return -1;
         }
 
-        static detail::data_extractor_ptr make_extractor(data_type t)
+        static std::unique_ptr<detail::data_extractor> make_extractor(data_type t)
         {
             switch (t)
             {
@@ -472,6 +472,20 @@ struct result final
                     return nullptr;
             }
         }
+
+        static auto get_extractor(data_type t)
+        {
+            static std::array<std::unique_ptr<detail::data_extractor>, 5> extractors;
+
+            auto& e = extractors[static_cast<int>(t)];
+            if (nullptr == e) {
+                e = make_extractor(t);
+                return e.get();
+            } else {
+                return e.get();
+            }
+        }
+
     public:
 
         explicit row(result const* const r = nullptr, int nrow = -1) noexcept
@@ -500,9 +514,9 @@ struct result final
             const auto nlen = PQgetlength(*res, row_nbr, field_nbr);
             auto const& desc = res->column_description[field_nbr];
             MappedType val{};
-            auto extractor = make_extractor(desc.type());
+            auto extractor = get_extractor(desc.type());
             extractor->parse_raw_data(buf, nlen);
-            detail::extract_value<MappedType>(std::move(extractor), val);
+            detail::extract_value<MappedType>(extractor, val);
             return val;
         }
 
