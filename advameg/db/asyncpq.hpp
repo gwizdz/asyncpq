@@ -497,19 +497,19 @@ struct result final
         }
 
         template <class MappedType>
-        boost::optional<MappedType> get(std::experimental::string_view field_name) const
+        std::optional<MappedType> get(std::experimental::string_view field_name) const
         {
             return get<MappedType>(map_field_name_to_pos(field_name));
         }
 
         template <class MappedType>
-        boost::optional<MappedType> get(int field_nbr) const
+        std::optional<MappedType> get(int field_nbr) const
         {
             // TO DO: handle field_nbr == -1, and wrong extractor cases, exceptions or error_codes
             BOOST_ASSERT(res != nullptr);
             BOOST_ASSERT(res->column_description);
             if (PQgetisnull(*res, row_nbr, field_nbr) != 0)
-                return boost::none;
+                return {};
             const auto buf = PQgetvalue(*res, row_nbr, field_nbr);
             const auto nlen = PQgetlength(*res, row_nbr, field_nbr);
             auto const& desc = res->column_description[field_nbr];
@@ -799,7 +799,7 @@ public:
     template <class CompletionHandler>
     void open(const char* conn_str, CompletionHandler&& handler) noexcept
     {
-        socket.get_io_service().post([this, conn_str, h = std::forward<CompletionHandler>(handler)] {
+        boost::asio::post([this, conn_str, h = std::forward<CompletionHandler>(handler)] {
             boost::system::error_code ec;
             this->open(conn_str, ec);
             h(ec);
