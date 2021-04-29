@@ -14,6 +14,7 @@
 #include <experimental/string_view>
 #include <type_traits>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <queue>
 #include <limits>
