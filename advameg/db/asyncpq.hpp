@@ -9,14 +9,16 @@
 #ifndef asyncpq_hpp
 #define asyncpq_hpp
 
-#include "libpq-fe.h"
+#include <libpq-fe.h>
 #include <boost/asio.hpp>
 #include <experimental/string_view>
 #include <type_traits>
 #include <functional>
-#include <mutex>
+#include <string>
+#include <queue>
 #include <limits>
 #include <condition_variable>
+#include <exception>
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/lexical_cast.hpp>
@@ -25,6 +27,43 @@
 namespace advameg {
 namespace db {
 namespace postgres {
+
+namespace exceptions {
+class nullException : public std::exception {
+public:
+    const char *what() const noexcept {
+        return "[ASYNCPQ] Null value access";
+    }
+};
+
+class connectionLostException : public std::exception {
+    std::string whatstr;
+
+public:
+    connectionLostException(std::string whatstr) {
+        this->whatstr = "[ASYNCPQ] Connection lost: "+whatstr;
+    }
+
+    const char *what() const noexcept {
+        return whatstr.c_str();
+    }
+};
+
+class AssertionException : public std::exception {
+    std::string whatstr;
+
+public:
+    AssertionException(std::string whatstr) {
+        this->whatstr = "[ASYNCPQ] "+whatstr;
+    }
+
+    const char *what() const noexcept {
+        return whatstr.c_str();
+    }
+};
+
+#define ASYNCPQ_ASSERT(...) if ((not (__VA_ARGS__))) BOOST_THROW_EXCEPTION(advameg::db::postgres::exceptions::AssertionException(std::string("[ASYNCPQ]Assertion failed: "#__VA_ARGS__)))
+}
 
 enum class error
 {
@@ -280,7 +319,7 @@ struct extractor_traits<T, typename std::enable_if<accepted_by_date_time_extract
 template <class T>
 typename std::enable_if<detail::is_basic_singular<T>::value>::type extract_value(data_extractor* pe, T& output)
 {
-    BOOST_ASSERT(pe);
+    ASYNCPQ_ASSERT(pe);
     auto e = dynamic_cast<typename extractor_traits<T>::type*>(pe);
     if (!e)
         BOOST_THROW_EXCEPTION(std::runtime_error{"Invalid extractor type."});
@@ -340,7 +379,7 @@ void extract_array(std::string const& s, Output& result)
 template <class T>
 typename std::enable_if<is_stl_array<T>::value>::type extract_value(data_extractor* pe, T& output)
 {
-    BOOST_ASSERT(pe);
+    ASYNCPQ_ASSERT(pe);
     auto e = dynamic_cast<typename extractor_traits<T>::type*>(pe);
     if (!e)
         BOOST_THROW_EXCEPTION(std::runtime_error{"Invalid extractor type."});
@@ -446,8 +485,8 @@ struct result final
 
         int map_field_name_to_pos(std::experimental::string_view field_name) const
         {
-            BOOST_ASSERT(res != nullptr);
-            BOOST_ASSERT(res->column_description);
+            ASYNCPQ_ASSERT(res != nullptr);
+            ASYNCPQ_ASSERT(res->column_description);
             if (auto pdesc = res->column_description.by_name(field_name))
                 return pdesc->num();
             return -1;
@@ -468,7 +507,7 @@ struct result final
                 case data_type::long_long_:
                     return std::make_unique<detail::data_extractor_impl<long long>>();
                 default:
-                    BOOST_ASSERT(0);
+                    ASYNCPQ_ASSERT(0);
                     return nullptr;
             }
         }
@@ -497,19 +536,19 @@ struct result final
         }
 
         template <class MappedType>
-        std::optional<MappedType> get(std::experimental::string_view field_name) const
+        MappedType get(std::experimental::string_view field_name) const
         {
             return get<MappedType>(map_field_name_to_pos(field_name));
         }
 
         template <class MappedType>
-        std::optional<MappedType> get(int field_nbr) const
+        MappedType get(int field_nbr) const
         {
             // TO DO: handle field_nbr == -1, and wrong extractor cases, exceptions or error_codes
-            BOOST_ASSERT(res != nullptr);
-            BOOST_ASSERT(res->column_description);
+            ASYNCPQ_ASSERT(res != nullptr);
+            ASYNCPQ_ASSERT(res->column_description);
             if (PQgetisnull(*res, row_nbr, field_nbr) != 0)
-                return {};
+                BOOST_THROW_EXCEPTION(exceptions::nullException());
             const auto buf = PQgetvalue(*res, row_nbr, field_nbr);
             const auto nlen = PQgetlength(*res, row_nbr, field_nbr);
             auto const& desc = res->column_description[field_nbr];
@@ -518,6 +557,13 @@ struct result final
             extractor->parse_raw_data(buf, nlen);
             detail::extract_value<MappedType>(extractor, val);
             return val;
+        }
+
+        bool is_null(int field_nbr) const
+        {
+            ASYNCPQ_ASSERT(res != nullptr);
+            ASYNCPQ_ASSERT(res->column_description);
+            return PQgetisnull(*res, row_nbr, field_nbr) != 0;
         }
 
         template <class MappedStruct>
@@ -761,6 +807,9 @@ private:
 
 class session final
 {
+    std::queue<std::function<void ()>> queue;
+    std::mutex queue_mut;
+
 public:
     explicit session(boost::asio::io_service& io_service) : socket{io_service}
     {}
@@ -816,10 +865,25 @@ public:
     }
 
     template <typename CompletionHandler>
-    void query(const char* query, CompletionHandler&& handler) noexcept
+    void query(const char* query, CompletionHandler&& handler)
     {
         if (0 == PQsendQuery(conn, query)) {
-            std::forward<CompletionHandler>(handler)(make_error_code(), result{});
+            std::string errmsg = PQerrorMessage(conn);
+            if (errmsg == "another command is already in progress\n") {
+                // Retry later
+                std::string querystr(query);
+                {
+                    queue_mut.lock();
+                    queue.push([=] () {
+                        this->query(querystr.c_str(), handler);
+                    });
+                    queue_mut.unlock();
+                }
+                return;
+            }
+
+            BOOST_THROW_EXCEPTION(exceptions::connectionLostException(errmsg));
+            //std::forward<CompletionHandler>(handler)(make_error_code(), result{});
         }
         else {
             socket.async_read_some(boost::asio::null_buffers(),
@@ -832,6 +896,19 @@ public:
                        auto res = PQgetResult(conn);
                        while (nullptr != PQgetResult(conn));
                        handler(boost::system::error_code{}, result{res});
+                   }
+                   // Next in queue
+                   {
+                       std::function<void ()> thisfnc = nullptr;
+                       queue_mut.lock();
+                       if (not queue.empty()) {
+                           thisfnc = queue.front();
+                           queue.pop();
+                       }
+                       queue_mut.unlock();
+                       if (thisfnc) {
+                           thisfnc();
+                       }
                    }
                });
         }
@@ -874,7 +951,7 @@ public:
     }
 
     session& operator[](std::size_t n) {
-        BOOST_ASSERT(n < connections.size());
+        ASYNCPQ_ASSERT(n < connections.size());
         return connections[n].second;
     }
 
@@ -897,8 +974,8 @@ private:
     {
         {
             std::lock_guard<std::mutex> lock{mtx};
-            BOOST_ASSERT(n < connections.size());
-            BOOST_ASSERT(connections[n].first == false);
+            ASYNCPQ_ASSERT(n < connections.size());
+            ASYNCPQ_ASSERT(connections[n].first == false);
             connections[n].first = true;
         }
         cv.notify_all();
@@ -923,32 +1000,32 @@ struct session_ref final
 {
     explicit session_ref(connection_pool& cp) : pool{&cp}
     {
-        BOOST_ASSERT(pool);
+        ASYNCPQ_ASSERT(pool);
         auto res = pool->lease();
         lease_id = res.first;
         conn = res.second;
     }
     ~session_ref() {
-        BOOST_ASSERT(pool);
+        ASYNCPQ_ASSERT(pool);
         if (lease_id != std::numeric_limits<std::size_t>::max())
             pool->give_back(lease_id);
     }
 
     explicit operator bool() const noexcept
     {
-        BOOST_ASSERT(conn);
+        ASYNCPQ_ASSERT(conn);
         return conn->operator bool();
     }
 
     auto error_message() const noexcept {
-        BOOST_ASSERT(conn);
+        ASYNCPQ_ASSERT(conn);
         return conn->error_message();
     }
 
     template <typename CompletionHandler>
     void query(const char* query_str, CompletionHandler&& handler) noexcept
     {
-        BOOST_ASSERT(conn);
+        ASYNCPQ_ASSERT(conn);
         conn->query(query_str, std::forward<CompletionHandler>(handler));
     }
 
